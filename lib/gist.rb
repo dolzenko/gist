@@ -1,6 +1,7 @@
 require 'open-uri'
 require 'net/http'
 require 'optparse'
+require 'yaml'
 
 require 'gist/manpage' unless defined?(Gist::Manpage)
 require 'gist/version' unless defined?(Gist::Version)
@@ -35,12 +36,22 @@ module Gist
     private_gist = defaults["private"]
     gist_filename = nil
     gist_extension = defaults["extension"]
+    update_mode = false
+    delete_mode = false
 
     opts = OptionParser.new do |opts|
-      opts.banner = "Usage: gist [options] [filename or stdin]"
+      opts.banner = "Usage: gist [options] [filename or stdin] [gist_to_update_or_delete]"
 
       opts.on('-p', '--[no-]private', 'Make the gist private') do |priv|
         private_gist = priv
+      end
+
+      opts.on('-u', '--update', 'Update existing gist (tries to find the Gist by file name when gist_to_update_or_delete is not specified)') do |up_mode|
+        update_mode = up_mode
+      end
+
+      opts.on('-d', '--delete', 'Deletes existing gist (tries to find the Gist by file name when gist_to_update_or_delete is not specified)') do |del_mode|
+        delete_mode = del_mode
       end
 
       t_desc = 'Set syntax highlighting of the Gist by file extension'
@@ -61,6 +72,11 @@ module Gist
         puts opts
         exit
       end
+
+      opts.on('-h', '--help', 'Display this screen') do
+        puts opts
+        exit
+      end
     end
 
     opts.parse!(args)
@@ -74,27 +90,119 @@ module Gist
           puts opts
           exit
         end
-
-        # Check if arg is a file. If so, grab the content.
-        if File.exists?(file = args[0])
-          input = File.read(file)
-          gist_filename = file
-          gist_extension = File.extname(file) if file.include?('.')
-        else
-          abort "Can't find #{file}"
+        unless delete_mode
+          # Check if arg is a file. If so, grab the content.
+          if File.exists?(file = args[0])
+            input = File.read(file)
+            gist_filename = file
+            gist_extension = File.extname(file) if file.include?('.')
+          else
+            abort "Can't find #{file}"
+          end
         end
       else
+        if update_mode
+          abort "When trying to update the Gist path to filename should be provided"
+        end
         # Read from standard input.
         input = $stdin.read
       end
 
-      url = write(input, private_gist, gist_extension, gist_filename)
-      browse(url)
-      puts copy(url)
+      if update_mode
+        if args[-1] =~ /^#{ Regexp.escape CREATE_URL }/
+          unless gist_existing_filename = find_gist_existing_filename(args[-1])
+            puts "Can't determine existing gist filename for #{ args[-1] }, using source file name #{ gist_filename }"
+            gist_existing_filename = gist_filename
+          end
+          gist_url = args[-1]
+        else
+          gist_url = find_gist_by_filename(gist_filename)
+          gist_existing_filename = gist_filename
+        end
+        unless gist_url
+          abort "Can't find gist for file #{ gist_filename }, specify path to the gist as the last option"
+        end
+        url = update(gist_url, gist_existing_filename, gist_filename, input)
+        after_create_or_update(url, gist_filename)
+        url
+      elsif delete_mode
+        gist_url = args[-1]
+        delete(gist_url)
+        puts "Deleted #{ gist_url }"
+      else
+        url = write(input, private_gist, gist_extension, gist_filename)
+        after_create_or_update(url, gist_filename)
+        url
+      end
     rescue => e
       warn e
       puts opts
     end
+  end
+
+  def after_create_or_update(url, gist_filename)
+    browse(url)
+    puts copy(url)
+    add_gists_cache(api_url(url), gist_filename)
+  end
+
+  def api_url(url)
+    url.sub("http://gist.github.com/", "http://gist.github.com/gists/")
+  end
+
+  def display_url(url)
+    url.sub("http://gist.github.com/gists/", "http://gist.github.com/")
+  end
+
+  def find_gist_existing_filename(gist_url)
+    open(File.join(gist_url, "edit")).read[/name="file_name\[(.+?)\]"/, 1] rescue nil
+  end
+
+  def find_gist_by_filename(filename)
+    gists_cache[filename] || update_gists_cache[filename]
+  end
+
+  def gists_cache
+    (YAML.load_file(gists_cache_path) || {}) rescue {}
+  end
+
+  def add_gists_cache(gist_url, gist_filename)
+    cache = gists_cache.merge(gist_filename => gist_url)
+    File.open(gists_cache_path, "w") do |gists_cache_file|
+      YAML.dump(cache, gists_cache_file)
+    end
+    cache
+  end
+
+  SIMULTANEOUS_CONNECTIONS = 10
+
+  def update_gists_cache(user = config("github.user"))
+    gist_urls = []
+
+    open("http://gist.github.com/api/v1/xml/gists/#{ user }") do |gists|
+      gist_urls = gists.read.scan(%r{ <repo>(\d+)</repo> }x).map { |gist_id| "#{ CREATE_URL }/#{ gist_id[0] }"}
+    end
+
+    puts "Updating gists cache for #{ gist_urls.size } gists..."
+    cache = {}
+
+    require 'thwait'
+    gist_urls.each_slice(SIMULTANEOUS_CONNECTIONS) do |urls|
+      threads = urls.map do |url|
+        Thread.new { cache[open(url).read[%r{ href="/raw/.+?/.+?/(.+?)" }x, 1]] = url }
+      end
+      ThreadsWait.all_waits(*threads)
+    end
+
+    File.open(gists_cache_path, "w") do |gists_cache_file|
+      YAML.dump(cache, gists_cache_file)
+    end
+
+    cache
+  end
+
+  def gists_cache_path
+    File.join(ENV["HOME"], ".gist.rc")
   end
 
   # Create a gist on gist.github.com
@@ -104,9 +212,34 @@ module Gist
     # Net::HTTP::Proxy returns Net::HTTP if PROXY_HOST is nil
     proxy = Net::HTTP::Proxy(PROXY_HOST, PROXY_PORT)
     req = proxy.post_form(url,
-      data(gist_filename, gist_extension, content, private_gist))
+                          data(gist_filename, gist_extension, content, private_gist))
 
     req['Location']
+  end
+
+  # Update the gist on gist.github.com
+  def update(put_url, gist_existing_filename, gist_filename, content)
+    url = URI.parse(put_url)
+
+    # Net::HTTP::Proxy returns Net::HTTP if PROXY_HOST is nil
+    proxy = Net::HTTP::Proxy(PROXY_HOST, PROXY_PORT)
+    proxy.post_form(url, update_data(gist_existing_filename, gist_filename, content))
+
+    put_url
+  end
+
+  # Deletes gist
+  def delete(gist_url)
+    url = URI.parse(gist_delete_url(gist_url))
+
+    proxy = Net::HTTP::Proxy(PROXY_HOST, PROXY_PORT)
+    proxy.post_form(url, { "_method" => "delete" }.merge(auth))
+
+    gist_url
+  end
+
+  def gist_delete_url(gist_url)
+    "http://gist.github.com/delete/%s" % gist_url[/\d+/, 0]
   end
 
   # Given a gist id, returns its content.
@@ -152,6 +285,13 @@ private
       'file_name[gistfile1]'     => name,
       'file_contents[gistfile1]' => content
     }.merge(private_gist ? { 'action_button' => 'private' } : {}).merge(auth)
+  end
+
+  def update_data(existing_name, name, content)
+    { "file_name[#{ existing_name }]" => name,
+      "file_contents[#{ existing_name }]" => content,
+      "file_ext[#{ existing_name }]"      => ".ru",
+      "_method" => "put" }.merge(auth)
   end
 
   # Returns a hash of the user's GitHub credentials if set.
