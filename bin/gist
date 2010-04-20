@@ -16,5 +16,11 @@
 #     chmod 755 gist &&
 #     mv gist /usr/local/bin/gist
 
-require 'gist'
+begin
+  require 'gist'
+rescue LoadError
+  require 'pathname'
+  $LOAD_PATH.unshift(Pathname.new(__FILE__).realpath + "../../lib")
+  require 'gist'
+end
 Gist.execute(*ARGV)
